@@ -5,9 +5,23 @@ local mode_names = {
   i = "Insert", c = "Command", t = "Terminal", o = "Operator-pending",
 }
 
-local function leader_string()
-  return vim.g.mapleader or "\\"
+local function canon_mode_key(m)
+  -- Collapse Visual family into one group
+  if m == "v" or m == "x" or m == "s" then return "V" end
+  return m
 end
+
+local function mode_display(m)
+  return mode_names[m] or m
+end
+
+local function add_mode_name(list, m)
+  local name = mode_display(m)
+  for _, v in ipairs(list) do if v == name then return end end
+  table.insert(list, name)
+end
+
+local function leader_string() return vim.g.mapleader or "\\" end
 
 local function pretty_lhs(lhs)
   if not lhs or lhs == "" then return "" end
@@ -53,7 +67,6 @@ local function origin_from_callback(cb)
   return info and info.short_src or nil
 end
 
--- Plugin + Category heuristics (short & slugs you used)
 local PLUGIN_SHORT = {
   ["telescope.nvim"]       = "Telescope",
   ["nvim-tree.lua"]        = "NvimTree",
@@ -134,10 +147,7 @@ local function guess_category(plugin, desc, lhs)
 end
 
 local function looks_builtin(m)
-  -- Best signal we’ve seen in your dump
   if m.desc and m.desc:match("^:help .+%-default$") then return true end
-  -- Many defaults don’t carry callbacks/rhs (but custom ones also can be empty).
-  -- Keep heuristic conservative.
   return false
 end
 
@@ -179,13 +189,13 @@ function M.collect(opts)
 end
 
 local function modes_list(mode)
-  -- Store a single-mode as multi_select so Notion is consistent
   return { mode_names[mode] or mode }
 end
 
 function M.to_rows(list, ctx)
   ctx = ctx or {}
-  local rows, seen = {}, {}
+  local rows_by_key = {}  -- key = buffer¦canon_mode¦lhs_pretty
+  local ordered_keys = {}
 
   for _, rec in ipairs(list) do
     local m = rec.map
@@ -207,16 +217,17 @@ function M.to_rows(list, ctx)
       name = name .. " (" .. PLUGIN_SHORT[plugin] .. ")"
     end
 
-    local key = table.concat({ buffer, mode, lhs_pretty }, "¦")
-    if not seen[key] then
-      seen[key] = true
+    local scope = (buffer == 1) and "Buffer" or "Global"
+    if plugin and ctx.project_plugins and ctx.project_plugins[plugin] then
+      scope = "Project"
+    end
 
-      local scope = (buffer == 1) and "Buffer" or "Global"
-      if plugin and ctx.project_plugins and ctx.project_plugins[plugin] then
-        scope = "Project"
-      end
+    local canon = canon_mode_key(mode)
+    local key = table.concat({ buffer, canon, lhs_pretty }, "¦")
 
-      local row = {
+    local row = rows_by_key[key]
+    if not row then
+      row = {
         name = name,
         lhs_pretty = lhs_pretty,
         action_suffix = (desc ~= "" and (" " .. desc)) or "",
@@ -225,22 +236,33 @@ function M.to_rows(list, ctx)
         category = category,
         prefix = prefix,
         scope = scope,
-        modes = modes_list(mode),
+        modes = {},                 -- we’ll accumulate all real modes here
         command = (rhs ~= "" and rhs) or (desc ~= "" and desc) or "",
         description = (desc ~= "" and desc) or "",
-        docs = nil,     -- you can fill docs URL via plugin slug map if you wish
-        date = vim.NIL,
+        docs = nil,
+        date = nil,                -- let create stamp now()
         tier = nil,
         plugin_page_id = (ctx.plugin_pages and plugin and ctx.plugin_pages[plugin]) or nil,
-        exists = false, -- set later when we query Notion (informational)
+        -- Stable UID across v/x/s: use the canonical group (V) instead of raw mode
+        uid = table.concat({ canon, lhs_pretty, scope }, "|"),
+        exists = false,
       }
-      table.insert(rows, row)
+      rows_by_key[key] = row
+      table.insert(ordered_keys, key)
     end
+
+    -- Always record the exact mode names present
+    add_mode_name(row.modes, mode)
+    -- Prefer the “most specific” type (once); this is optional but harmless
+    if row.type_ ~= "chord" and type_ == "chord" then row.type_ = "chord" end
   end
 
-  -- Simple sort: by Name
+  -- Emit rows in a deterministic order
+  local rows = {}
+  for _, k in ipairs(ordered_keys) do table.insert(rows, rows_by_key[k]) end
   table.sort(rows, function(a,b) return a.name < b.name end)
   return rows
 end
+
 
 return M

@@ -1,5 +1,7 @@
 local M = {}
 
+local jnull = (vim.json and vim.json.null) or vim.NIL
+
 local defaults = {
   database_id = nil,
   app_page_id = nil,
@@ -35,13 +37,24 @@ local defaults = {
     Description = "Description",
     Docs        = "Docs",
     Prefix      = "Prefix",
+    UID         = "UID",      -- NEW: add a rich_text column “UID” in Notion
   },
 
   notion_version = "2022-06-28",
+  touch_date_on_create = true,
+  touch_date_on_update = false,
+
+  built_in_marker_value = "Built in",
+  require_confirm = true,
+
+  -- HTTP resiliency
+  timeout_ms = 60000,   -- curl timeout
+  retries    = 2,       -- small retry count
 }
 
-local cfg = {}
+local function now_iso_utc() return os.date("!%Y-%m-%dT%H:%M:%SZ") end
 
+local cfg, abort_flag = {}, false
 local function has_api_key()
   local k = vim.env.NOTION_API_KEY
   if not k or k == "" then
@@ -50,7 +63,247 @@ local function has_api_key()
   end
   return k
 end
+local function trim(s) return (s or ""):gsub("^%s+",""):gsub("%s+$","") end
 
+-- log buffer
+local function open_log()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "# notio sync log", "" })
+  vim.bo[buf].bufhidden, vim.bo[buf].filetype = "wipe", "markdown"
+  vim.api.nvim_set_current_buf(buf)
+  local function append(line)
+    local n = vim.api.nvim_buf_line_count(buf)
+    vim.api.nvim_buf_set_lines(buf, n, n, false, { line })
+  end
+  return append
+end
+
+-- builders
+local function text_frag(s, is_code)
+  if not s or s == "" then return {} end
+  return {{
+    type = "text",
+    text = { content = s },
+    annotations = {
+      bold = false, italic = false, strikethrough = false,
+      underline = false, code = is_code or false,
+      color = (is_code and "red") or "default",
+    },
+    plain_text = s,
+  }}
+end
+
+local function multi_select(list)
+  local out = {}
+  for _, name in ipairs(list or {}) do out[#out+1] = { name = name } end
+  return out
+end
+
+local function humanize_command(cmd)
+  cmd = (cmd or ""):gsub("%s+"," ")
+  if cmd:find(":m '") and cmd:find("gv=gv") then
+    if cmd:find("%-2<CR>gv=gv") then return "Move selection up one line (keep selection)" end
+    if cmd:find("%+1<CR>gv=gv") then return "Move selection down one line (keep selection)" end
+    return "Move selection (keep selection)"
+  end
+  return nil
+end
+
+local function build_props(row, for_update)
+  local P = cfg.properties
+  local props = {}
+
+  if row.date == vim.NIL then row.date = nil end
+  if row.docs == vim.NIL then row.docs = nil end
+
+  props[P.Name]        = { title = { { type = "text", text = { content = row.name } } } }
+  props[P.Action]      = { rich_text = vim.list_extend(text_frag(row.lhs_pretty or "", true), text_frag(row.action_suffix or "", false)) }
+  props[P.Application] = { relation  = { { id = cfg.app_page_id } } }
+  props[P.Platform]    = { multi_select = multi_select(cfg.platform) }
+  props[P.Mode]        = { multi_select = multi_select(row.modes or {}) }
+
+  -- Description fallback chain
+  local desc_txt = row.description or ""
+  if desc_txt == "" and row.action_suffix and row.action_suffix ~= "" then
+    desc_txt = trim(row.action_suffix)
+  end
+  if desc_txt == "" and row.command and trim(row.command):lower() ~= "built in" then
+    desc_txt = row.command
+  end
+  if desc_txt == "" then
+    local friendly = humanize_command(row.command)
+      if friendly then desc_txt = friendly end
+  end
+  props[P.Description] = { rich_text = text_frag(desc_txt, false) }
+
+  props[P.Command]     = { rich_text = text_frag(row.command, false) }
+  props[P.Docs]        = { url = row.docs or jnull }
+
+  props[P.Status]      = row.status   and { select = { name = row.status   } } or { select = jnull }
+  props[P.Type]        = row.type_    and { select = { name = row.type_    } } or { select = jnull }
+  props[P.Category]    = row.category and { select = { name = row.category } } or { select = jnull }
+  props[P.Scope]       = row.scope    and { select = { name = row.scope    } } or { select = jnull }
+  props[P.Prefix]      = row.prefix   and { select = { name = row.prefix   } } or { select = jnull }
+  props[P.Tier]        = row.tier     and { select = { name = row.tier     } } or { select = jnull }
+
+  if row.plugin_page_id then
+    props[P.Plugin] = { relation = { { id = row.plugin_page_id } } }
+  end
+
+  -- UID (if DB column exists)
+  if P.UID and row.uid then
+    props[P.UID] = { rich_text = text_frag(row.uid, false) }
+  end
+
+  -- Date
+  if row.date ~= nil then
+    if row.date == jnull then
+      props[P.Date] = { date = jnull }
+    elseif type(row.date) == "string" then
+      props[P.Date] = { date = { start = row.date } }
+    elseif type(row.date) == "table" then
+      props[P.Date] = { date = row.date }
+    end
+  else
+    if (not for_update) and cfg.touch_date_on_create then
+      props[P.Date] = { date = { start = now_iso_utc() } }
+    end
+  end
+
+  return props
+end
+
+local function to_notion_page(row)
+  return {
+    parent = { database_id = cfg.database_id },
+    icon   = { type = "external", external = { url = cfg.icon_url } },
+    cover  = { type = "external", external = { url = cfg.cover_url } },
+    properties = build_props(row, false),
+  }
+end
+
+local function to_notion_update(row)
+  if cfg.touch_date_on_update and (row.date == nil or row.date == vim.NIL) then
+    row.date = now_iso_utc()
+  end
+  return { properties = build_props(row, true) }
+end
+
+-- fingerprint (for plan/dedupe)
+local function row_fingerprint(row)
+  local modes = {}
+  for _, m in ipairs(row.modes or {}) do modes[#modes+1] = m end
+  table.sort(modes)
+  return table.concat({
+    row.status or "",
+    row.type_ or "",
+    row.category or "",
+    row.scope or "",
+    row.prefix or "",
+    row.tier or "",
+    table.concat(modes, ","),
+    (row.lhs_pretty or "") .. (row.action_suffix or ""),
+    row.command or "",
+    row.description or "",
+    row.plugin_page_id or "",
+  }, "|")
+end
+
+local function compute_plan(rows, index, built_in_value)
+  local plan, stats = {}, { create = 0, update = 0, skip_same = 0, skip_built_in = 0 }
+  local by_uid = index.by_uid or {}
+  local by_name = index.by_name or {}
+  local by_command = index.by_command or {}
+  local built_in_lc = trim(built_in_value or ""):lower()
+
+  for _, row in ipairs(rows) do
+    local info = nil
+
+    -- 1) primary key: UID (if present on both sides)
+    if row.uid and by_uid[row.uid] then
+      info = by_uid[row.uid]
+    end
+
+    -- 2) fallback: Name
+    if not info then
+      info = by_name[row.name]
+    end
+
+    -- 3) fallback: Command (non “Built in” only)
+    if not info then
+      local cmd = trim(row.command or "")
+      if cmd ~= "" and cmd:lower() ~= built_in_lc then
+        info = by_command[cmd]
+      end
+    end
+
+    if info and info.built_in then
+      plan[#plan+1] = { op = "skip_built_in", row = row, existing_id = info.id }
+      stats.skip_built_in = stats.skip_built_in + 1
+    elseif info then
+      row.exists = true
+      local fp = row_fingerprint(row)
+      if fp == info.fingerprint then
+        plan[#plan+1] = { op = "skip_same", row = row, existing_id = info.id }
+        stats.skip_same = stats.skip_same + 1
+      else
+        plan[#plan+1] = { op = "update", row = row, existing_id = info.id }
+        stats.update = stats.update + 1
+      end
+    else
+      plan[#plan+1] = { op = "create", row = row, existing_id = nil }
+      stats.create = stats.create + 1
+    end
+  end
+  return plan, stats
+end
+
+local function open_plan_buffer(plan, stats)
+  local lines = {
+    ("# notio dry list — %d rows (create=%d, update=%d, skip_same=%d, skip_built_in=%d)")
+      :format(#plan, stats.create, stats.update, stats.skip_same, stats.skip_built_in),
+    "",
+    "OP           Mode     Scope     Type         Category   Name",
+    "----------------------------------------------------------------------------",
+  }
+  for _, it in ipairs(plan) do
+    local r = it.row
+    lines[#lines+1] = string.format(
+      "%-12s %-8s %-8s %-12s %-10s %s",
+      it.op, (r.modes and r.modes[1] or "?"), (r.scope or "?"), (r.type_ or "?"), (r.category or "?"), r.name or "?"
+    )
+  end
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = "markdown"
+  vim.api.nvim_set_current_buf(buf)
+end
+
+-- upsert with per-row logging (we pass existing_id from plan → no re-query)
+local function upsert_one(notion, row, existing_id, log)
+  if existing_id then
+    local res = notion:update_page(existing_id, to_notion_update(row))
+    if res.ok then
+      log(("UPDATE  ✔  %s"):format(row.name))
+      return true
+    else
+      log(("UPDATE  ✖  %s  (%s)"):format(row.name, res.err or "error"))
+      return false
+    end
+  else
+    local res = notion:create_page(to_notion_page(row))
+    if res.ok then
+      log(("CREATE  ✔  %s"):format(row.name))
+      return true
+    else
+      log(("CREATE  ✖  %s  (%s)"):format(row.name, res.err or "error"))
+      return false
+    end
+  end
+end
+
+-- public API
 function M.setup(opts)
   cfg = vim.tbl_deep_extend("force", defaults, opts or {})
   if not cfg.database_id or not cfg.app_page_id then
@@ -62,17 +315,22 @@ function M.setup(opts)
     M.sync({ dry = Dry })
   end, { nargs = "?" })
 
-  vim.api.nvim_create_user_command("NotioDryRun", function()
-    M.sync({ dry = true })
+  vim.api.nvim_create_user_command("NotioDryRun", function() M.sync({ dry = true }) end, {})
+
+  vim.api.nvim_create_user_command("NotioAbort", function()
+    abort_flag = true
+    vim.notify("notio: abort requested — will stop after current request.")
   end, {})
 
-  -- NEW: ping (token + DB reachability)
+  -- Diagnostics
   vim.api.nvim_create_user_command("NotioPing", function()
     if not has_api_key() then return end
     local notion = require("notio.notion").new({
       token = vim.env.NOTION_API_KEY,
       version = cfg.notion_version,
       rate_limit_ms = cfg.rate_limit_ms,
+      timeout_ms = cfg.timeout_ms,
+      retries = cfg.retries,
     })
     local me, merr = notion:me()
     if me then
@@ -88,165 +346,11 @@ function M.setup(opts)
       vim.notify("notio: database check failed " .. (dberr or ""), vim.log.levels.ERROR)
     end
   end, {})
-
-  -- NEW: create a single smoke-test page
-  vim.api.nvim_create_user_command("NotioTestCreate", function()
-    if not has_api_key() then return end
-    if not cfg.database_id or not cfg.app_page_id then
-      vim.notify("notio: database_id/app_page_id missing", vim.log.levels.ERROR)
-      return
-    end
-    local now = os.date("!%Y-%m-%d %H:%M:%S UTC")
-    local row = {
-      name = "Notio Smoke Test (" .. now .. ")",
-      lhs_pretty = "<leader>pv",
-      action_suffix = " Yazi: project view",
-      status = cfg.status,
-      type_ = "leader",
-      category = "Navigation",
-      prefix = "<leader>",
-      scope = "Project",
-      modes = { "Normal" },
-      command = "Plugin: yazi.nvim",
-      description = "Created by :NotioTestCreate",
-      docs = nil,
-      date = vim.NIL,
-      tier = "Essentials",
-      plugin_page_id = (cfg.plugin_pages and cfg.plugin_pages["yazi.nvim"]) or nil,
-    }
-
-    local props = M._build_props(row)
-    local payload = {
-      parent = { database_id = cfg.database_id },
-      icon   = { type = "external", external = { url = cfg.icon_url } },
-      cover  = { type = "external", external = { url = cfg.cover_url } },
-      properties = props,
-    }
-
-    local notion = require("notio.notion").new({
-      token = vim.env.NOTION_API_KEY,
-      version = cfg.notion_version,
-      rate_limit_ms = cfg.rate_limit_ms,
-    })
-    if notion:create_page(payload) then
-      vim.notify("notio: smoke test page created ✔")
-    else
-      vim.notify("notio: smoke test failed", vim.log.levels.ERROR)
-    end
-  end, {})
-
-  -- NEW: readable dry list into a scratch buffer
-  vim.api.nvim_create_user_command("NotioDryList", function()
-    local km = require("notio.keymaps").collect({
-      include_modes = cfg.include_modes,
-      skip_builtins = cfg.skip_builtins,
-      skip_plug     = cfg.skip_plug_mappings,
-      project_plugins = cfg.project_plugins,
-      plugin_pages    = cfg.plugin_pages,
-    })
-    local rows = require("notio.keymaps").to_rows(km, {
-      platform = table.concat(cfg.platform, ", "),
-      status   = cfg.status,
-      project_plugins = cfg.project_plugins,
-      plugin_pages    = cfg.plugin_pages,
-    })
-    local lines = { ("# notio dry list — %d rows"):format(#rows), "" }
-    for _, r in ipairs(rows) do
-      lines[#lines+1] =
-        string.format("%-8s  %-8s  %-11s  %-8s  %s",
-          (r.modes and r.modes[1] or "?"), (r.scope or "?"), (r.type_ or "?"),
-          (r.category or "?"), r.name or "?")
-    end
-    local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.bo[buf].bufhidden = "wipe"
-    vim.bo[buf].filetype = "markdown"
-    vim.api.nvim_set_current_buf(buf)
-  end, {})
 end
 
--- ---------- property builders ----------
-local function multi_select(list)
-  local out = {}
-  for _, name in ipairs(list or {}) do table.insert(out, { name = name }) end
-  return out
-end
-
-function M._build_props(row)
-  local P = cfg.properties
-  local function text(s, is_code)
-    if not s or s == "" then return {} end
-    return {{
-      type = "text",
-      text = { content = s },
-      annotations = {
-        bold = false, italic = false, strikethrough = false,
-        underline = false, code = is_code or false, color = "default",
-      },
-      plain_text = s,
-    }}
-  end
-
-  local props = {
-    [P.Name] = { title = { { type = "text", text = { content = row.name } } } },
-    [P.Action] = { rich_text = vim.list_extend(
-      text(row.lhs_pretty or "", true),
-      text(row.action_suffix or "", false)
-    ) },
-    [P.Application] = { relation = { { id = cfg.app_page_id } } },
-    [P.Status]      = row.status and { select = { name = row.status } } or vim.NIL,
-    [P.Type]        = row.type_ and { select = { name = row.type_ } } or vim.NIL,
-    [P.Plugin]      = (row.plugin_page_id and { relation = { { id = row.plugin_page_id } } }) or { relation = {} },
-    [P.Tier]        = row.tier and { select = { name = row.tier } } or vim.NIL,
-    [P.Platform]    = { multi_select = multi_select(cfg.platform) },
-    [P.Scope]       = row.scope and { select = { name = row.scope } } or vim.NIL,
-    [P.Mode]        = { multi_select = multi_select(row.modes or {}) },
-    [P.Date]        = { date = row.date or vim.NIL },
-    [P.Category]    = row.category and { select = { name = row.category } } or vim.NIL,
-    [P.Command]     = { rich_text = text(row.command, false) },
-    [P.Description] = { rich_text = text(row.description, false) },
-    [P.Docs]        = row.docs and { url = row.docs } or { url = vim.NIL },
-    [P.Prefix]      = row.prefix and { select = { name = row.prefix } } or vim.NIL,
-  }
-  return props
-end
-
-local function to_notion_page(row)
-  return {
-    parent = { database_id = cfg.database_id },
-    icon   = { type = "external", external = { url = cfg.icon_url } },
-    cover  = { type = "external", external = { url = cfg.cover_url } },
-    properties = M._build_props(row),
-  }
-end
-
-local function to_notion_update(row)
-  return { properties = M._build_props(row) }
-end
-
--- ---------- upsert ----------
-local function upsert_one(notion, row, dry)
-  if dry then
-    vim.notify(
-      ("notio[dry]: %s  %s  [%s/%s/%s]")
-        :format(row.exists and "UPDATE" or "CREATE",
-                row.name,
-                row.modes and row.modes[1] or "?",
-                row.type_ or "?",
-                row.category or "?")
-    )
-    return true
-  end
-  local existing = notion:query_by_name(cfg.database_id, row.name)
-  if existing and existing.id then
-    return notion:update_page(existing.id, to_notion_update(row))
-  end
-  return notion:create_page(to_notion_page(row))
-end
-
--- ---------- public sync ----------
 function M.sync(opts)
   if not has_api_key() then return end
+  abort_flag = false
   local dry = opts and opts.dry or false
 
   local km = require("notio.keymaps").collect({
@@ -256,14 +360,12 @@ function M.sync(opts)
     project_plugins = cfg.project_plugins,
     plugin_pages    = cfg.plugin_pages,
   })
-
   local rows = require("notio.keymaps").to_rows(km, {
     platform = table.concat(cfg.platform, ", "),
     status   = cfg.status,
     project_plugins = cfg.project_plugins,
     plugin_pages    = cfg.plugin_pages,
   })
-
   if #rows == 0 then
     vim.notify("notio: nothing to sync.", vim.log.levels.INFO)
     return
@@ -273,16 +375,74 @@ function M.sync(opts)
     token = vim.env.NOTION_API_KEY,
     version = cfg.notion_version,
     rate_limit_ms = cfg.rate_limit_ms,
+    timeout_ms = cfg.timeout_ms,
+    retries = cfg.retries,
+    command_prop = cfg.properties.Command,
   })
 
-  local ok_count, fail_count = 0, 0
-  for _, row in ipairs(rows) do
-    local ok = upsert_one(notion, row, dry)
-    if ok then ok_count = ok_count + 1 else fail_count = fail_count + 1 end
+  local index = notion:index(cfg.database_id, cfg.properties, cfg.built_in_marker_value)
+  local plan, stats = compute_plan(rows, index, cfg.built_in_marker_value)
+
+  if dry then
+    open_plan_buffer(plan, stats)
+    return
   end
 
-  vim.notify(("notio: %s %d, failed %d")
-    :format(dry and "DRY processed" or "Synced", ok_count, fail_count),
+  if cfg.require_confirm then
+    local msg = ("Create %d, Update %d, Skip %d. Proceed?")
+      :format(stats.create, stats.update, stats.skip_same + stats.skip_built_in)
+    local choice = vim.fn.confirm(msg, "&Yes\n&No", 2)
+    if choice ~= 1 then
+      vim.notify("notio: aborted by user.")
+      return
+    end
+  end
+
+  local log = open_log()
+  log(("# plan: create=%d update=%d skip_same=%d skip_built_in=%d")
+      :format(stats.create, stats.update, stats.skip_same, stats.skip_built_in))
+  log("")
+
+  local ok_count, fail_count, skipped = 0, 0, (stats.skip_same + stats.skip_built_in)
+  local created_guard = {} -- key on UID|Name|Command to prevent same-run dup creates
+
+  for _, it in ipairs(plan) do
+    if abort_flag then
+      log("")
+      log("ABORTED by user.")
+      break
+    end
+
+    if it.op == "create" then
+      local guard_key = table.concat({
+        it.row.uid or "",
+        it.row.name or "",
+        (it.row.command or ""):gsub("%s+"," "),
+      }, "|")
+
+      if created_guard[guard_key] then
+        log(("SKIP    ·  %s  (duplicate create in this run)"):format(it.row.name))
+        skipped = skipped + 1
+      else
+        local ok = upsert_one(notion, it.row, nil, log)
+        if ok then
+          ok_count = ok_count + 1
+          created_guard[guard_key] = true
+        else
+          fail_count = fail_count + 1
+        end
+      end
+
+    elseif it.op == "update" then
+      local ok = upsert_one(notion, it.row, it.existing_id, log)
+      if ok then ok_count = ok_count + 1 else fail_count = fail_count + 1 end
+
+    else
+      log(("SKIP    ·  %s  (%s)"):format(it.row.name, it.op))
+    end
+  end
+
+  vim.notify(("notio: Synced %d, skipped %d, failed %d"):format(ok_count, skipped, fail_count),
     (fail_count == 0) and vim.log.levels.INFO or vim.log.levels.WARN)
 end
 
