@@ -24,7 +24,7 @@ end
 -- normalize <...> tokens so UIDs are stable across runs
 local function canon_lhs(s)
   if not s or s == "" then return "" end
-  -- leader normalization (you already do this elsewhere too)
+  -- leader normalization
   s = s:gsub("^<Space>", "<leader>")
 
   -- unify modifier case
@@ -32,6 +32,8 @@ local function canon_lhs(s)
        :gsub("<[aA]%-", "<M-")   -- Alt → Meta (or swap to <A-> if you prefer)
        :gsub("<[cC]%-", "<C-")
        :gsub("<[sS]%-", "<S-")
+  -- normalize single-letter ctrl/meta/shift keys to uppercase
+  s = s:gsub("<([CMS])%-(%a)>", function(mod, k) return "<"..mod.."-"..k:upper()..">" end)
 
   -- unify common key names’ case
   local map = { cr="CR", esc="Esc", tab="Tab", space="Space", bs="BS" }
@@ -233,7 +235,7 @@ function M.to_rows(list, ctx)
 
   local function canon_mode_key(m) return (m=="v" or m=="x" or m=="s") and "V" or m end
   local function leader_string() return vim.g.mapleader or "\\" end
-  local function pretty_lhs(lhs)
+  local function pretty_lhs_local(lhs)
     if not lhs or lhs == "" then return "" end
     local L, s = leader_string(), lhs
     if L == " " and s:sub(1,1) == " " then s = "<leader>" .. s:sub(2) end
@@ -261,14 +263,13 @@ function M.to_rows(list, ctx)
   for _, rec in ipairs(list) do
     local m, mode, buffer = rec.map, rec.mode, rec.buffer
     local lhs = m.lhs or ""
-    local lhs_pretty = pretty_lhs(lhs)
-    lhs_pretty = canon_lhs(lhs_pretty)
+    local lhs_pretty = canon_lhs(pretty_lhs_local(lhs))  -- normalize tokens for stable UIDs
     local rhs = m.rhs or (m.callback and "<lua-callback>") or ""
     local origin = (type(m.callback)=="function" and (debug.getinfo(m.callback,"S").short_src)) or ""
     local desc = m.desc or ""
 
     local plugin = guess_plugin(desc, rhs, origin, buffer)
-    local category = guess_category(plugin, desc, lhs)
+    local category = guess_category(plugin, desc, lhs_pretty)
     local type_ = guess_type(lhs, mode)
     local prefix = prefix_of(lhs_pretty)
 
@@ -284,20 +285,20 @@ function M.to_rows(list, ctx)
     local row = rows_by_key[key]
     if not row then
       row = {
-        name         = name,
-        lhs_pretty   = lhs_pretty,
-        action_suffix= (desc ~= "" and (" " .. desc)) or "",
-        status       = ctx.status or "Active",
-        type_        = type_,
-        category     = category,
-        prefix       = prefix,
-        modes        = { mode_display(mode) },
-        scope        = scope,
-        command      = (plugin and ("Plugin: " .. plugin)) or (desc ~= "" and desc) or "Custom configuration",
-        docs         = nil,
-        tier         = nil,         -- defaulted to "A" on create
+        name           = name,
+        lhs_pretty     = lhs_pretty,
+        action_suffix  = (desc ~= "" and (" " .. desc)) or "",
+        status         = ctx.status or "Active",
+        type_          = type_,
+        category       = category,
+        prefix         = prefix,
+        modes          = { mode_display(mode) },
+        scope          = scope,
+        command        = (plugin and ("Plugin: " .. plugin)) or (desc ~= "" and desc) or "Custom configuration",
+        docs           = nil,
+        tier           = nil,         -- defaulted to "A" on create
         plugin_page_id = ctx.plugin_pages and ctx.plugin_pages[plugin] or nil,
-        uid          = nil,         -- set after merging modes
+        uid            = nil,         -- set after merging modes
       }
       rows_by_key[key] = row
       ordered[#ordered+1] = row
@@ -322,6 +323,5 @@ function M.to_rows(list, ctx)
 
   return ordered
 end
-
 
 return M

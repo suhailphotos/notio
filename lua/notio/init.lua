@@ -65,7 +65,6 @@ local function canon_command_key(s)
   s = trim((s or ""):lower()):gsub("%s+"," ")
   local m = s:match("^plugin:%s*(.+)$")
   if m then
-    -- normalize common plugin name variants
     m = m:gsub("%.lua$", ""):gsub("%.nvim$", ""):gsub("%s+", "")
     return "plugin:" .. m
   end
@@ -86,10 +85,9 @@ local function has_api_key()
   return k
 end
 
-local function trim(s) return (s or ""):gsub("^%s+",""):gsub("%s+$","") end
-
 local function canon_mode_key(m) return (m == "v" or m == "x" or m == "s") and "V" or m end
 local function norm_cmd(s) return trim((s or ""):lower():gsub("%s+"," ")) end
+-- Stable identity independent of dynamic mode detection
 local function binding_fp_of_row(row)
   return table.concat({ row.type_ or "", row.prefix or "", row.lhs_pretty or "" }, "|")
 end
@@ -192,7 +190,7 @@ local function build_props(row, for_update)
     props[P.Plugin] = { relation = { { id = row.plugin_page_id } } }
   end
 
-  -- UID (if DB column exists)
+  -- UID (if DB column exists) — write on both create & update
   if P.UID and row.uid then
     props[P.UID] = { rich_text = text_frag(row.uid, true, "blue") }
   end
@@ -233,10 +231,10 @@ end
 
 -- -------- fingerprints & planning --------
 
--- Keep fingerprint minimal so we don't churn on cosmetic fields
--- Only trigger UPDATE when the keybinding itself changes (mode/scope/lhs)
+-- Only trigger UPDATE/REBIND when the binding itself changes (mode/scope/lhs)
+-- Use stable fingerprint for equality; (UID can legitimately change due to mode merging)
 local function row_fingerprint(row)
-  return row.uid or ""
+  return binding_fp_of_row(row)
 end
 
 local function open_plan_buffer(plan, stats)
@@ -264,10 +262,14 @@ end
 local function compute_plan(rows, index, built_in_value)
   local plan, stats = {}, { create = 0, update = 0, rebind = 0, skip_same = 0, skip_built_in = 0 }
   local by_uid, by_name, by_command = index.by_uid or {}, index.by_name or {}, index.by_command or {}
+  local by_binding = index.by_binding or {}
   local built_in_lc = trim(built_in_value or ""):lower()
 
+  -- Prefer stable binding_fp; fall back to UID/synth_uid
   local function have_fp_from_info(info)
-    return (info.uid and info.uid ~= "" and info.uid) or (info.synth_uid or "")
+    return (info.binding_fp and info.binding_fp ~= "" and info.binding_fp)
+        or (info.uid and info.uid ~= "" and info.uid)
+        or (info.synth_uid or "")
   end
 
   for _, row in ipairs(rows) do
@@ -275,6 +277,7 @@ local function compute_plan(rows, index, built_in_value)
     local cmd_key = canon_command_key(row.command)
     local uid = row.uid
     local cmd_lc = trim(row.command or ""):lower()
+    local bind_key = binding_fp_of_row(row)
 
     -- Always skip built-ins (and never create)
     if cmd_lc == built_in_lc or cmd_lc == "" then
@@ -286,14 +289,18 @@ local function compute_plan(rows, index, built_in_value)
     -- 1) match by UID (explicit or synthetic from previous runs)
     if uid and by_uid[uid] then info = by_uid[uid] end
 
-    -- 2) fallback: Name
+    -- 2) fallback: stable binding (type|prefix|lhs)
+    if not info and bind_key ~= "" and by_binding[bind_key] then info = by_binding[bind_key] end
+
+    -- 3) fallback: exact Name (may differ if you renamed titles)
     if not info and row.name and by_name[row.name] then info = by_name[row.name] end
 
-    -- 3) fallback: Command (non built-in)
-    local info_by_cmd = (cmd_key ~= "" and by_command[cmd_key]) or nil
+    -- (Intentionally NO plugin-wide fallback; it's too coarse for per-key pages)
+    local info_by_cmd = nil
 
     if info then
-      -- Same page; only update if binding+command changed
+      -- Stick to the DB UID once we've found the page (prevents churn)
+      if info.uid and info.uid ~= "" then row.uid = info.uid end
       local want = row_fingerprint(row)
       local have = have_fp_from_info(info)
       if want == have then
@@ -304,8 +311,8 @@ local function compute_plan(rows, index, built_in_value)
         stats.update = stats.update + 1
       end
 
-    elseif info_by_cmd and not info_by_cmd.built_in then
-      -- IMPORTANT: if command points to a page that already has the same binding, skip
+    -- Only use command-fallback for plugin-qualified commands
+    elseif info_by_cmd then
       local want = row_fingerprint(row)
       local have = have_fp_from_info(info_by_cmd)
       if want == have then
@@ -322,7 +329,6 @@ local function compute_plan(rows, index, built_in_value)
       end
 
     else
-      -- No match
       if cfg.update_only or (cfg.never_create_builtins and (cmd_lc == "" or cmd_lc == built_in_lc)) then
         plan[#plan+1] = { op = "skip_no_match", row = row }
         stats.skip_same = stats.skip_same + 1
@@ -337,11 +343,11 @@ local function compute_plan(rows, index, built_in_value)
   return plan, stats
 end
 
--- upsert with per-row logging; `op` distinguishes UPDATE vs REBIND status/date tweaks
+-- upsert with per-row logging
 local function upsert_one(notion, row, existing_id, log, op)
   if existing_id then
     if op == "rebind" and not cfg.touch_date_on_update then
-      row.date = now_iso_utc()          -- stamp Date on rebind
+      row.date = now_iso_utc()
     end
     if op == "rebind" then
       row.status = "Changed"
@@ -438,6 +444,18 @@ function M.setup(opts)
       }}
     end
 
+    local count = 0
+    -- iterate by_name to touch every page exactly once
+    for _, info in pairs(idx.by_name or {}) do
+      if (info.uid or "") == "" and (info.synth_uid or "") ~= "" and not info.built_in then
+        local res = notion:update_page(info.id, rt_code_blue(info.synth_uid))
+        if res.ok then count = count + 1 end
+      end
+    end
+    vim.notify(("notio: backfilled UID on %d pages"):format(count))
+  end, {})
+
+  -- Show effective config
   vim.api.nvim_create_user_command("NotioDebug", function()
     local lines = {
       "# notio effective config",
@@ -452,17 +470,6 @@ function M.setup(opts)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.bo[buf].bufhidden, vim.bo[buf].filetype = "wipe", "markdown"
     vim.api.nvim_set_current_buf(buf)
-  end, {})
-
-    local count = 0
-    -- iterate by_name to touch every page exactly once
-    for _, info in pairs(idx.by_name or {}) do
-      if (info.uid or "") == "" and (info.synth_uid or "") ~= "" and not info.built_in then
-        local res = notion:update_page(info.id, rt_code_blue(info.synth_uid))
-        if res.ok then count = count + 1 end
-      end
-    end
-    vim.notify(("notio: backfilled UID on %d pages"):format(count))
   end, {})
 end
 
@@ -524,7 +531,7 @@ function M.sync(opts)
   log("")
 
   local ok_count, fail_count, skipped = 0, 0, (stats.skip_same + stats.skip_built_in)
-  local created_guard = {} -- prevent duplicate creates within the same run
+  local created_guard = {}
 
   for _, it in ipairs(plan) do
     if abort_flag then
