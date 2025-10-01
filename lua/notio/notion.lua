@@ -122,14 +122,22 @@ local function rich_text(prop)
   return table.concat(out)
 end
 
--- pull just the first rich-text run; normalize to leader
-local function first_token(s)
-  s = trim(s or "")
-  if s == "" then return "" end
-  local tok = s:match("^%S+") or s
-  tok = tok:gsub("^<Space>", "<leader>")
-  return tok
-end
+  -- Parse "<mode>|<lhs>|<scope>" from UID if present
+  local function lhs_from_uid(uid_text)
+    if not uid_text or uid_text == "" then return nil end
+    local _m, lhs = uid_text:match("^([^|]*)|([^|]*)|[^|]*$")
+    if lhs and lhs ~= "" then return canon_lhs(lhs) end
+    return nil
+  end
+
+  -- First rich-text run in Action (legacy fallback)
+  local function lhs_from_action_first_run(prop)
+    local arr = (type(prop)=="table" and prop.rich_text) or {}
+    local first = arr and arr[1]
+    local txt = (first and (first.plain_text or (first.text and first.text.content))) or ""
+    txt = txt:gsub("^<Space>", "<leader>")
+    return canon_lhs(txt)
+  end
 
 -- -------- pagination --------
 function Notion:list_all_pages(database_id)
@@ -157,7 +165,7 @@ local function canon_uid(uid)
   return uid
 end
 
-function Notion:index(database_id, prop_names, built_in_value)
+function Notion:index(database_id, prop_names, built_in_value, app_page_id)
   local pages = self:list_all_pages(database_id)
   local P = prop_names or {}
   local Name   = P.Name   or "Name"
@@ -168,6 +176,7 @@ function Notion:index(database_id, prop_names, built_in_value)
   local Type   = P.Type   or "Type"
   local Prefix = P.Prefix or "Prefix"
   local Action = P.Action or "Action"
+  local Application = P.Application or "Application"
 
   local function sel_name(prop)
     if type(prop)=="table" and type(prop.select)=="table" then return prop.select.name or "" end
@@ -204,12 +213,27 @@ function Notion:index(database_id, prop_names, built_in_value)
 
   for _, page in ipairs(pages) do
     local props = page.properties or {}
+
+    -- Filter by Application relation (only our namespace)
+    if app_page_id then
+      local app_ok = false
+      local pr = props[Application]
+      if type(pr) == "table" and type(pr.relation) == "table" then
+        for _, r in ipairs(pr.relation) do
+          if r.id == app_page_id then app_ok = true; break end
+        end
+      end
+      if not app_ok then goto continue end
+    end
+
     local name = title_text(props[Name])
     if name ~= "" then
       local cmd_text = (rich_text(props[Command]) or ""):gsub("%s+"," ")
       local uid_text = canon_uid(rich_text(props[UID]) or "")
-      local lhs_text = lhs_from_action_first_run(props[Action])
-      lhs_text = canon_lhs(lhs_text)
+      local lhs_text = lhs_from_uid(uid_text)
+      if not lhs_text or lhs_text == "" then
+        lhs_text = lhs_from_action_first_run(props[Action])
+      end
       if lhs_text == "" then
         local nm = title_text(props[Name])
         lhs_text = (nm:gsub("%s*%b()", "")):gsub("^%s+",""):gsub("%s+$","")
@@ -270,6 +294,7 @@ function Notion:index(database_id, prop_names, built_in_value)
         if not prev or prev.last_edited_time < info.last_edited_time then by_uid[synth_uid] = info end
       end
     end
+    ::continue::
   end
 
   return { by_uid = by_uid, by_name = by_name, by_command = by_command, by_binding = by_binding }

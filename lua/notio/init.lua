@@ -28,6 +28,9 @@ local defaults = {
   icon_url  = "https://www.notion.so/icons/keyboard-alternate_lightgray.svg",
 
   project_plugins = { ["yazi.nvim"] = true, ["telescope.nvim"] = true },
+  -- If true, Action will be updated on subsequent runs (default false = "respect manual edits")
+  update_action_on_update = false,
+  lock_property = "Lock",  -- if present & checked on a page, skip updates
 
   properties = {
     Name        = "Name",
@@ -149,7 +152,14 @@ local function build_props(row, for_update)
   if row.docs == vim.NIL then row.docs = nil end
 
   props[P.Name]        = { title = { { type = "text", text = { content = row.name } } } }
-  props[P.Action]      = { rich_text = vim.list_extend(text_frag(row.lhs_pretty or "", true, "red"), text_frag(row.action_suffix or "", false)) }
+  -- Action: create-time only unless explicitly allowed
+  local action_rt = vim.list_extend(
+    text_frag(row.lhs_pretty or "", true, "red"),
+    text_frag(row.action_suffix or "", false)
+  )
+  if not for_update or cfg.update_action_on_update then
+    props[P.Action] = { rich_text = action_rt }
+  end
   props[P.Application] = { relation  = { { id = cfg.app_page_id } } }
   props[P.Platform]    = { multi_select = multi_select(cfg.platform) }
   props[P.Mode]        = { multi_select = multi_select(row.modes or {}) }
@@ -287,10 +297,10 @@ local function compute_plan(rows, index, built_in_value)
     end
 
     local matched = nil
-    -- 1) binding is king
-    if bind_key ~= "" and by_binding[bind_key] then info = by_binding[bind_key]; matched = "binding" end
-    -- 2) stable UID (only if we didn’t find binding)
-    if not info and uid and by_uid[uid] then info = by_uid[uid]; matched = "uid" end
+    -- 1) UID is king (stable across Action edits)
+    if uid and uid ~= "" and by_uid[uid] then info = by_uid[uid]; matched = "uid" end
+    -- 2) binding if no UID
+    if not info and bind_key ~= "" and by_binding[bind_key] then info = by_binding[bind_key]; matched = "binding" end
     -- 3) name as last resort
     if not info and row.name and by_name[row.name] then info = by_name[row.name]; matched = "name" end
 
@@ -298,11 +308,8 @@ local function compute_plan(rows, index, built_in_value)
     local info_by_cmd = nil
 
     if info then
-      -- Only keep the DB's UID if we *matched by UID*.
-      -- If we matched by binding or name, keep our computed row.uid so the update will fix the DB.
-      if matched == "uid" and info.uid and info.uid ~= "" then
-        row.uid = info.uid
-      end
+      -- If we matched by UID, keep DB UID; otherwise keep computed UID so update can fix it.
+      if matched == "uid" and info.uid and info.uid ~= "" then row.uid = info.uid end
       local want = row_fingerprint(row)
       local have = have_fp_from_info(info)
       if want == have then
@@ -509,7 +516,7 @@ function M.sync(opts)
     command_prop = cfg.properties.Command,
   })
 
-  local index = notion:index(cfg.database_id, cfg.properties, cfg.built_in_marker_value)
+  local index = notion:index(cfg.database_id, cfg.properties, cfg.built_in_marker_value, cfg.app_page_id)
   local plan, stats = compute_plan(rows, index, cfg.built_in_marker_value)
 
   if dry then
