@@ -21,6 +21,28 @@ local function add_mode_name(list, m)
   table.insert(list, name)
 end
 
+-- normalize <...> tokens so UIDs are stable across runs
+local function canon_lhs(s)
+  if not s or s == "" then return "" end
+  -- leader normalization (you already do this elsewhere too)
+  s = s:gsub("^<Space>", "<leader>")
+
+  -- unify modifier case
+  s = s:gsub("<[mM]%-", "<M-")
+       :gsub("<[aA]%-", "<M-")   -- Alt → Meta (or swap to <A-> if you prefer)
+       :gsub("<[cC]%-", "<C-")
+       :gsub("<[sS]%-", "<S-")
+
+  -- unify common key names’ case
+  local map = { cr="CR", esc="Esc", tab="Tab", space="Space", bs="BS" }
+  s = s:gsub("<(%a+)>", function(name) return "<"..(map[name:lower()] or name)..">" end)
+
+  -- unify backslash alias
+  s = s:gsub("<C%-[bB]slash>", "<C-\\>")
+
+  return s
+end
+
 local function leader_string() return vim.g.mapleader or "\\" end
 
 local function pretty_lhs(lhs)
@@ -30,6 +52,13 @@ local function pretty_lhs(lhs)
   if L == " " and s:sub(1,1) == " " then s = "<leader>" .. s:sub(2) end
   s = s:gsub("^<Space>", "<leader>")
   return s
+end
+
+local function starts_with_any(s, list)
+  for _, p in ipairs(list or {}) do
+    if s:sub(1, #p) == p then return true end
+  end
+  return false
 end
 
 local function prefix_of(lhs)
@@ -79,6 +108,7 @@ local PLUGIN_SHORT = {
   ["undotree"]             = "UndoTree",
   ["vim-fugitive"]         = "Fugitive",
   ["iris"]                 = "Iris",
+  ["nvterm"]               = "NvTerm",
 }
 
 local PLUGIN_CATEGORY = {
@@ -93,6 +123,7 @@ local PLUGIN_CATEGORY = {
   ["undotree"]             = "Session",
   ["vim-fugitive"]         = "Git",
   ["iris"]                 = "Session",
+  ["nvterm"]               = "Terminal",
 }
 
 local function guess_plugin(desc, rhs, origin, buffer)
@@ -122,7 +153,9 @@ local function guess_plugin(desc, rhs, origin, buffer)
   if origin:find("yazi")      then return "yazi.nvim" end
   if origin:find("dap")       then return "nvim-dap" end
   if origin:find("cmp")       then return "nvim-cmp" end
-  if origin:find("tmux_nav")  then return "nvim-tmux-navigation" end
+  if origin:find("nvim%-tmux%-navigation") or origin:find("tmux[_%-]nav") then
+    return "nvim-tmux-navigation"
+  end
   if origin:find("undotree")  then return "undotree" end
   if origin:find("fugitive")  then return "vim-fugitive" end
   if origin:find("iris")      then return "iris" end
@@ -180,6 +213,8 @@ function M.collect(opts)
     if m and m.lhs then
       if opts.skip_plug and m.lhs:match("^<Plug>") then goto continue end
       if opts.skip_builtins and looks_builtin(m) then goto continue end
+      local lhs_pre = pretty_lhs(m.lhs)
+      if starts_with_any(lhs_pre, opts.skip_prefixes) then goto continue end
       table.insert(out, r)
     end
     ::continue::
@@ -194,17 +229,42 @@ end
 
 function M.to_rows(list, ctx)
   ctx = ctx or {}
-  local rows_by_key = {}  -- key = buffer¦canon_mode¦lhs_pretty
-  local ordered_keys = {}
+  local rows_by_key, ordered = {}, {}
+
+  local function canon_mode_key(m) return (m=="v" or m=="x" or m=="s") and "V" or m end
+  local function leader_string() return vim.g.mapleader or "\\" end
+  local function pretty_lhs(lhs)
+    if not lhs or lhs == "" then return "" end
+    local L, s = leader_string(), lhs
+    if L == " " and s:sub(1,1) == " " then s = "<leader>" .. s:sub(2) end
+    s = s:gsub("^<Space>", "<leader>")
+    return s
+  end
+
+  -- Prefer Visual > Insert > Command > Terminal > Operator > Normal
+  local canon_priority = { ["V"]=6, ["i"]=5, ["c"]=4, ["t"]=3, ["o"]=2, ["n"]=1 }
+  local function canon_from_modes(ms)
+    local best, bestp = "n", -1
+    for _, name in ipairs(ms or {}) do
+      local m = (name == "Visual" or name == "Visual-Select" or name == "Select") and "V"
+                or (name == "Insert" and "i")
+                or (name == "Command" and "c")
+                or (name == "Terminal" and "t")
+                or (name == "Operator-pending" and "o")
+                or "n"
+      local p = canon_priority[m] or 0
+      if p > bestp then best, bestp = m, p end
+    end
+    return best
+  end
 
   for _, rec in ipairs(list) do
-    local m = rec.map
-    local mode = rec.mode
-    local buffer = rec.buffer
+    local m, mode, buffer = rec.map, rec.mode, rec.buffer
     local lhs = m.lhs or ""
     local lhs_pretty = pretty_lhs(lhs)
+    lhs_pretty = canon_lhs(lhs_pretty)
     local rhs = m.rhs or (m.callback and "<lua-callback>") or ""
-    local origin = origin_from_callback(m.callback)
+    local origin = (type(m.callback)=="function" and (debug.getinfo(m.callback,"S").short_src)) or ""
     local desc = m.desc or ""
 
     local plugin = guess_plugin(desc, rhs, origin, buffer)
@@ -213,55 +273,54 @@ function M.to_rows(list, ctx)
     local prefix = prefix_of(lhs_pretty)
 
     local name = lhs_pretty
-    if plugin and PLUGIN_SHORT[plugin] then
-      name = name .. " (" .. PLUGIN_SHORT[plugin] .. ")"
-    end
+    if plugin and PLUGIN_SHORT[plugin] then name = name .. " (" .. PLUGIN_SHORT[plugin] .. ")" end
 
     local scope = (buffer == 1) and "Buffer" or "Global"
-    if plugin and ctx.project_plugins and ctx.project_plugins[plugin] then
-      scope = "Project"
-    end
+    if plugin and ctx.project_plugins and ctx.project_plugins[plugin] then scope = "Project" end
 
-    local canon = canon_mode_key(mode)
-    local key = table.concat({ buffer, canon, lhs_pretty }, "¦")
+    -- Group by buffer + lhs only (so we merge multiple modes of the same key)
+    local key = table.concat({ buffer, lhs_pretty }, "¦")
 
     local row = rows_by_key[key]
     if not row then
       row = {
-        name = name,
-        lhs_pretty = lhs_pretty,
-        action_suffix = (desc ~= "" and (" " .. desc)) or "",
-        status = ctx.status or "Active",
-        type_ = type_,
-        category = category,
-        prefix = prefix,
-        scope = scope,
-        modes = {},                 -- we’ll accumulate all real modes here
-        command = (rhs ~= "" and rhs) or (desc ~= "" and desc) or "",
-        description = (desc ~= "" and desc) or "",
-        docs = nil,
-        date = nil,                -- let create stamp now()
-        tier = nil,
-        plugin_page_id = (ctx.plugin_pages and plugin and ctx.plugin_pages[plugin]) or nil,
-        -- Stable UID across v/x/s: use the canonical group (V) instead of raw mode
-        uid = table.concat({ canon, lhs_pretty, scope }, "|"),
-        exists = false,
+        name         = name,
+        lhs_pretty   = lhs_pretty,
+        action_suffix= (desc ~= "" and (" " .. desc)) or "",
+        status       = ctx.status or "Active",
+        type_        = type_,
+        category     = category,
+        prefix       = prefix,
+        modes        = { mode_display(mode) },
+        scope        = scope,
+        command      = (plugin and ("Plugin: " .. plugin)) or (desc ~= "" and desc) or "Custom configuration",
+        docs         = nil,
+        tier         = nil,         -- defaulted to "A" on create
+        plugin_page_id = ctx.plugin_pages and ctx.plugin_pages[plugin] or nil,
+        uid          = nil,         -- set after merging modes
       }
       rows_by_key[key] = row
-      table.insert(ordered_keys, key)
+      ordered[#ordered+1] = row
+    else
+      -- merge extra modes into multi-select if same lhs & buffer
+      add_mode_name(row.modes, mode)
     end
-
-    -- Always record the exact mode names present
-    add_mode_name(row.modes, mode)
-    -- Prefer the “most specific” type (once); this is optional but harmless
-    if row.type_ ~= "chord" and type_ == "chord" then row.type_ = "chord" end
   end
 
-  -- Emit rows in a deterministic order
-  local rows = {}
-  for _, k in ipairs(ordered_keys) do table.insert(rows, rows_by_key[k]) end
-  table.sort(rows, function(a,b) return a.name < b.name end)
-  return rows
+  -- Finalize description + uid (after modes are merged)
+  for _, row in ipairs(ordered) do
+    row.description = (row.action_suffix or ""):gsub("^%s+","")
+    local canon = canon_from_modes(row.modes)
+    row.uid = table.concat({ canon, row.lhs_pretty, row.scope }, "|")
+  end
+
+  -- set platform + status from ctx (consistent)
+  for _, row in ipairs(ordered) do
+    row.platform = ctx.platform
+    row.status   = ctx.status or "Active"
+  end
+
+  return ordered
 end
 
 
