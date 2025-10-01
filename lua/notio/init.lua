@@ -286,21 +286,23 @@ local function compute_plan(rows, index, built_in_value)
       goto continue
     end
 
-    -- 1) match by UID (explicit or synthetic from previous runs)
-    if uid and by_uid[uid] then info = by_uid[uid] end
-
-    -- 2) fallback: stable binding (type|prefix|lhs)
-    if not info and bind_key ~= "" and by_binding[bind_key] then info = by_binding[bind_key] end
-
-    -- 3) fallback: exact Name (may differ if you renamed titles)
-    if not info and row.name and by_name[row.name] then info = by_name[row.name] end
+    local matched = nil
+    -- 1) binding is king
+    if bind_key ~= "" and by_binding[bind_key] then info = by_binding[bind_key]; matched = "binding" end
+    -- 2) stable UID (only if we didn’t find binding)
+    if not info and uid and by_uid[uid] then info = by_uid[uid]; matched = "uid" end
+    -- 3) name as last resort
+    if not info and row.name and by_name[row.name] then info = by_name[row.name]; matched = "name" end
 
     -- (Intentionally NO plugin-wide fallback; it's too coarse for per-key pages)
     local info_by_cmd = nil
 
     if info then
-      -- Stick to the DB UID once we've found the page (prevents churn)
-      if info.uid and info.uid ~= "" then row.uid = info.uid end
+      -- Only keep the DB's UID if we *matched by UID*.
+      -- If we matched by binding or name, keep our computed row.uid so the update will fix the DB.
+      if matched == "uid" and info.uid and info.uid ~= "" then
+        row.uid = info.uid
+      end
       local want = row_fingerprint(row)
       local have = have_fp_from_info(info)
       if want == have then

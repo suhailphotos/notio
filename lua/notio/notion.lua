@@ -173,13 +173,18 @@ function Notion:index(database_id, prop_names, built_in_value)
     if type(prop)=="table" and type(prop.select)=="table" then return prop.select.name or "" end
     return ""
   end
-  local function first_token_of_action(prop)
-    local arr = (type(prop)=="table" and prop.rich_text) or {}
-    local txt = (arr and arr[1] and (arr[1].plain_text or (arr[1].text and arr[1].text.content))) or ""
-    txt = (txt:gsub("^%s+",""):gsub("%s+$",""))
-    txt = txt:gsub("^<Space>", "<leader>")
-    return (txt:match("^%S+") or txt)
-  end
+
+ -- Return the full lhs from the first rich_text run of Action.
+ -- Do NOT strip trailing spaces; e.g. "<leader> " must keep the space.
+ local function lhs_from_action_first_run(prop)
+   local arr = (type(prop)=="table" and prop.rich_text) or {}
+   local first = arr and arr[1]
+   local txt = (first and (first.plain_text or (first.text and first.text.content))) or ""
+   -- Normalize "<Space>" alias only; no trimming.
+   txt = txt:gsub("^<Space>", "<leader>")
+   return canon_lhs(txt)
+ end
+
   local function canon_mode_from_ms(ms)
     local set, arr = {}, (type(ms)=="table" and ms.multi_select) or {}
     for _, it in ipairs(arr or {}) do set[it.name or ""] = true end
@@ -203,7 +208,7 @@ function Notion:index(database_id, prop_names, built_in_value)
     if name ~= "" then
       local cmd_text = (rich_text(props[Command]) or ""):gsub("%s+"," ")
       local uid_text = canon_uid(rich_text(props[UID]) or "")
-      local lhs_text = first_token_of_action(props[Action])
+      local lhs_text = lhs_from_action_first_run(props[Action])
       lhs_text = canon_lhs(lhs_text)
       if lhs_text == "" then
         local nm = title_text(props[Name])
