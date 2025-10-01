@@ -1,133 +1,204 @@
 # notio
 
-**neovim keymaps → notion, on demand.**  
-Export all your custom keybindings from your Neovim config and import them into a Notion database as a tidy, searchable table.
+**Neovim keymaps → Notion, on demand.**  
+Collect your Neovim keymaps, fingerprint them, and **sync** (create/update) rows in a Notion database—with rich-text fields, relations, and guardrails to protect manual edits.
 
-> Designed to live at `$MATRIX/nvim/notio` and to be used as a regular Neovim plugin.
+> Built for my setup first. It assumes a specific Notion schema (see below) with an **Application** relation and optional **Plugin** relations.
 
 ---
 
 ## What it does
 
-- Scans **all modes** (n, v, x, s, i, c, t, o) for keymaps (global + loaded buffer‑locals).
-- **Deduplicates** identical `(buffer, mode, lhs)` entries.
-- **Guesses plugin + category** using description/rhs/origin heuristics (e.g., Telescope, NvimTree).
-- Emits a **Notion‑friendly CSV** with the exact columns your database expects.
-- Adds a `:ExportKeysNotionCSV {optional_path}` Neovim command.
-- Defaults to `~/Documents/Scratch/nvim_keybinds_notion.csv` if no path is given.
-
-The implementation is a straight port of your working script into a plugin module (`lua/notio/init.lua`) plus a lightweight loader (`plugin/notio.lua`) that registers the user command.
+- Scans **all modes** (`n, v, x, s, i, c, t, o`) for global + loaded buffer-local maps.
+- Normalizes LHS tokens (e.g. `<Space> → <leader>`, `<c-x> → <C-X>`, common key name casing) for stability.
+- Merges multi-mode bindings to one row (e.g., Visual+Normal → single page with **Mode** multiselect).
+- Generates a **stable UID**: `"<M>|<lhs>|<Scope>"` (`M ∈ {n,V,i,c,t,o}`; Scope = Global/Buffer/Project).
+- Guesses **Plugin** and **Category** by description/RHS/origin.
+- **Skips built-ins** and noisy prefix families by default.
+- **Syncs to Notion**: create/update/rebind with rich-text `Action`, `Description`, relations, selects, etc.
+- Provides dry-run planning and a live log buffer during sync.
 
 ---
 
 ## Install
 
-Place this repo at: **`$MATRIX/nvim/notio`**
-
-With **lazy.nvim** (example when you publish to GitHub as `suhailphotos/notio`):
+With **lazy.nvim** (GitHub):
 
 ```lua
 {
   "suhailphotos/notio",
-  config = function()
-    -- no setup needed yet; command is auto-registered
-  end,
+  name = "notio",
+  version = "v0.1.1",
+  dependencies = { "nvim-lua/plenary.nvim" },
+  opts = {
+    database_id = "275a1865-b187-81b9-bc4a-fbe5d44e2911",
+    app_page_id = "13fa1865-b187-815a-b3d7-f0a23559e641",
+    plugin_pages = {
+      ["yazi.nvim"]            = "278a1865-b187-8015-9e18-c51affadd8b1",
+      ["telescope.nvim"]       = "278a1865-b187-80ac-9b86-c94087ad60da",
+      ["nvim-lspconfig"]       = "278a1865-b187-8013-a3d4-c6b3c29190f1",
+      ["nvim-cmp"]             = "278a1865-b187-8050-a679-f32738da7e50",
+      ["nvim-tmux-navigation"] = "275a1865-b187-80c9-9aad-f4129638223f",
+      ["vim-fugitive"]         = "278a1865-b187-80a3-a5ee-d76871e57751",
+      -- add others as you create plugin pages
+    },
+    skip_builtins = true,
+    skip_prefixes = { "[", "]", "g", "z" },
+    skip_plug_mappings = true,
+    project_plugins = { ["yazi.nvim"]=true, ["telescope.nvim"]=true },
+    update_only = true, -- default: don't mass-create; update/rebind only
+  },
+  cond = function() return (vim.env.NOTION_API_KEY or "") ~= "" end,
+  config = function(_, opts) require("notio").setup(opts) end,
 }
 ```
 
-Local dev path (lazy.nvim):
+Local dev path:
 
 ```lua
 {
   dir = vim.fn.expand("$MATRIX") .. "/nvim/notio",
   name = "notio",
+  dependencies = { "nvim-lua/plenary.nvim" },
+  config = function()
+    require("notio").setup({
+      database_id = "275a1865-b187-81b9-bc4a-fbe5d44e2911",
+      app_page_id = "13fa1865-b187-815a-b3d7-f0a23559e641",
+      plugin_pages = {
+        ["yazi.nvim"]            = "278a1865-b187-8015-9e18-c51affadd8b1",
+        ["telescope.nvim"]       = "278a1865-b187-80ac-9b86-c94087ad60da",
+        ["nvim-lspconfig"]       = "278a1865-b187-8013-a3d4-c6b3c29190f1",
+        ["nvim-cmp"]             = "278a1865-b187-8050-a679-f32738da7e50",
+        ["nvim-tmux-navigation"] = "275a1865-b187-80c9-9aad-f4129638223f",
+        ["vim-fugitive"]         = "278a1865-b187-80a3-a5ee-d76871e57751",
+      },
+      skip_builtins = true,
+      skip_prefixes = { "[", "]", "g", "z" },
+      skip_plug_mappings = true,
+      project_plugins = { ["yazi.nvim"]=true, ["telescope.nvim"]=true },
+      update_only = true,
+    })
+  end,
 }
 ```
 
-> Packer or other managers work the same—ensure `plugin/notio.lua` is on `runtimepath`.
+> Requires `NOTION_API_KEY` in your environment. `:NotioPing` will validate token + DB connection.
+
+---
+
+## Commands
+
+- `:NotioSync` — run the sync plan against Notion (prompts to confirm).
+- `:NotioSync dry` or `:NotioDryRun` — show a **plan buffer**: `create / update / rebind / skip`.
+- `:NotioAbort` — ask the current sync to stop after the in-flight request.
+- `:NotioPing` — sanity check: token owner + database reachability.
+- `:NotioBackfillUID` — writes **UID** into rows that are missing it (uses the synthetic UID).
+- `:NotioDebug` — opens a small buffer showing effective config toggles.
+
+During a real sync, a **log buffer** opens (success/failure per row).
+
+---
+
+## Matching & upsert rules (TL;DR)
+
+- **Stable UID**: `mode|lhs|scope` (e.g., `n|<leader>pf|Project`), where `lhs` is normalized.
+- Primary match order: **UID** → **binding fingerprint** (`type|prefix|lhs`) → **Name**.
+- If binding is unchanged → **skip**.  
+  If binding changed → **update** (or **rebind**, marked `Changed` and optionally `Date` touched).  
+- **Built-ins** (`Command = "Built in"` or empty) are always skipped and never created.
+- Default guardrails:
+  - `update_only = true` — won’t mass-create unless you flip it.
+  - `never_create_builtins = true` — don’t create empty/“Built in” rows.
+  - `skip_prefixes = { "[", "]", "g", "z" }` — drop noisy families up-front.
+
+---
+
+## Notion behavior
+
+- **Application** relation is set to your `app_page_id` for every synced row (namespaces your DB).
+- **Plugin** relation is set when a plugin is detected *and* you provide a page id in `plugin_pages`.
+- **Action** (rich_text):  
+  - First run is the LHS as code (colored).  
+  - Suffix is description text (non-code).  
+  - **By default, Action is only written on create** to respect manual edits.  
+    Set `update_action_on_update = true` if you want it overwritten during updates.
+- **Description** (rich_text): written on create. If empty, it falls back to a friendly RHS interpretation or `Command`.
+- **UID** (rich_text): always written (code, blue); used to keep rows stable over time.
+- **Mode** / **Platform**: multi-selects; Mode merges all modes for the same `(buffer,lhs)` into one row.
+- **Scope**: `Global` / `Buffer` / `Project` (project determined by `project_plugins`).
+- **Tier**: defaulted to `"A"` on create, left alone on update unless you pass one.
+- **Date**: touched on create; optionally on update (see `touch_date_on_*`).
+
+---
+
+## Required Notion schema (properties)
+
+| Property       | Type          | Notes                                                                 |
+|----------------|---------------|-----------------------------------------------------------------------|
+| **Name**       | Title         | Pretty LHS (+ short plugin label in parens when known)                |
+| **Action**     | Rich text     | First run = code LHS; suffix = human text                             |
+| **Description**| Rich text     | Human text; complements `Action`                                      |
+| **Command**    | Rich text     | Source (“Plugin: slug” or explicit command/desc)                      |
+| **UID**        | Rich text     | Code, blue; `mode|lhs|scope`                                          |
+| **Application**| Relation      | Must point to your Neovim page (`app_page_id`)                        |
+| **Plugin**     | Relation      | Optional per-plugin relation (via `plugin_pages`)                     |
+| **Status**     | Select        | Defaults to `Active`                                                  |
+| **Type**       | Select        | `leader | chord | prefix | motion | operator | command`                |
+| **Category**   | Select        | e.g., `Search`, `Navigation`, `Debug`, `LSP`, etc.                    |
+| **Prefix**     | Select        | `<leader>`, `g`, `z`, `:`, `none`, etc.                               |
+| **Scope**      | Select        | `Global | Buffer | Project`                                           |
+| **Mode**       | Multi-select  | `Normal`, `Visual`, `Insert`, `Command`, `Terminal`, `Select`, `Operator-pending` |
+| **Platform**   | Multi-select  | Typically `"Linux, Windows, macOS"`                                   |
+| **Tier**       | Select        | Defaults to `A` on create                                             |
+| **Date**       | Date          | Touched on create                                                     |
+| **Docs**       | URL           | Optional                                                              |
+
+> Names must match exactly (you can rename in `opts.properties` later; today they’re hardcoded to these labels).
+
+---
+
+## Configuration
+
+These live in `lua/notio/init.lua` defaults and can be overridden via `opts`:
+
+- **database_id**, **app_page_id** *(required)*
+- **plugin_pages**: `{ ["plugin-slug"] = "notion-page-id", ... }`
+- **include_modes**: `{ "n","v","x","s","i","c","t","o" }`
+- **skip_builtins**: `true`  
+- **skip_plug_mappings**: `true`
+- **skip_prefixes**: `{ "[", "]", "g", "z" }`
+- **project_plugins**: e.g. `{ ["yazi.nvim"]=true, ["telescope.nvim"]=true }`
+- **update_only**: `true` (flip to allow create)
+- **update_action_on_update**: `false` (set `true` to rewrite `Action` on updates)
+- **platform**: `{ "Linux", "Windows", "macOS" }`
+- **status**: `"Active"`
+- **rate_limit_ms**: `350`
+- **notion_version**: `"2022-06-28"` (API version)
 
 ---
 
 ## Usage
 
-Inside Neovim:
+1. Set `NOTION_API_KEY` in your shell (1Password/env).
+2. Open Neovim.
+3. `:NotioPing` → verify token & database.
+4. `:NotioDryRun` → inspect plan (create / update / rebind / skip).
+5. `:NotioSync` → confirm & run. Watch the log buffer.
 
-```vim
-:ExportKeysNotionCSV
-:ExportKeysNotionCSV ~/Documents/Scratch/my_keymaps.csv
-```
-
-- If no path is provided, it writes to `~/Documents/Scratch/nvim_keybinds_notion.csv`.
-- You’ll see a `vim.notify` with the final path and row count when it completes.
-
-### Headless (CLI) export (optional)
-
-Create a tiny wrapper script named `notio` somewhere on your `$PATH`:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-OUT="${1:-${NOTIO_OUT:-$HOME/Documents/Scratch/nvim_keybinds_notion.csv}}"
-nvim --headless +'lua require("notio").export_notion_csv([['"'"'${OUT}'"'"']])' +qa
-echo "wrote: ${OUT}"
-```
-
-Then run:
-```bash
-notio                         # default path
-notio ~/Documents/Scratch/my_keymaps.csv
-```
+Abort anytime with `:NotioAbort`.
 
 ---
 
-## Output schema (CSV)
+## Heuristics (plugin & category)
 
-Columns (order matters and matches your Notion database import):
-
-```
-Name,Action,Application,Application 1,Category,Command,Date,Description,Docs,
-Mode,Platform,Plugin,Plugin 1,Prefix,Scope,Status,Tier,Type
-```
-
-### Column notes
-
-- **Name**: Pretty LHS; if a known plugin is detected, appends short label `(Telescope|NvimTree|…)`.
-- **Action**: Either `"<lhs> <desc>"` if a description exists, else the lhs itself.
-- **Application**: Pre-filled with your Notion page reference for Neovim.
-- **Docs / Plugin 1**: Notion page links per plugin (from a local map).
-- **Mode**: Expanded human name (Normal, Visual, …).
-- **Platform**: `"Linux, Windows, macOS"` by default.
-- **Prefix**: `<leader>`, `g`, `t`, brackets, quotes, etc., or `"none"`.
-- **Scope**: `"Global"` or `"Buffer"` (buffer-local maps are treated as Buffer).
-- **Type**: `"leader" | "chord" | "prefix" | "motion" | "operator" | "command"`.
+- **Plugin**: inferred from description prefixes (`"DAP:"`, `"Explorer:"`, `"Yazi:"`, `"Theme:"`, `"CMP"`), RHS contents (`NvimTree`, `Yazi`, `Undotree`, `Git`), and callback origin paths (`telescope`, `lsp`, `dap`, etc.).  
+- **Category**: from the plugin or description (`Search`, `Navigation`, `Debug`, `LSP`, `Windows/Tabs`, `Session`, `Git`, `Terminal`, `Clipboard`, `Editing`).
 
 ---
 
-## Heuristics (how plugins/categories are guessed)
+## Project status
 
-`guess_plugin(desc, rhs, origin, buffer, mode)` checks, in order:
-
-1. **Description cues** (e.g., `DAP:`, `Explorer:`, `Yazi:`, `Theme:`).
-2. **RHS strings** (e.g., contains `NvimTree`, `Yazi`, `Undotree`, `Git`).
-3. **Lua origin file** (source path from `debug.getinfo`), e.g. `lazy/telescope.lua`.
-
-If none match, it returns `nil` and the row is labeled **Custom configuration** (or **Requires LSP attached** for certain buffer-local/LSP cases).
-
-`guess_category(plugin, desc, lhs)` then maps to **Search / Navigation / Debug / LSP / Editing / Windows/Tabs / Session / Git / Terminal / Clipboard / Custom configuration**.
-
----
-
-## Configuration (lightweight)
-
-The following tables live near the top of `lua/notio/init.lua` and can be edited or extended in-place:
-
-- `NEOVIM_NOTION` (your Neovim page label + URL shown in the **Application** column)
-- `DEFAULT_PLATFORM`
-- `NOTION_LINKS` (plugin slug → Notion page link label)
-- `PLUGIN_SHORT` (slug → short label for `Name` parentheses)
-- `PLUGIN_CATEGORY` (slug → category)
-
-> In a later iteration we can add a `require("notio").setup{ ... }` to set these at runtime via `vim.g` or a Lua table—today the port keeps it simple and explicit.
+This works for **my** Notion setup today. In a future release I’ll add an initializer (or `setup{}`) for folks who don’t use relations (or want different property names/shapes).
 
 ---
 
@@ -135,54 +206,27 @@ The following tables live near the top of `lua/notio/init.lua` and can be edited
 
 ```
 notio/
-├─ README.md
-├─ LICENSE            # MIT
-├─ lua/
-│  └─ notio/
-│     └─ init.lua     # the exporter module (ported code lives here)
-└─ plugin/
-   └─ notio.lua       # registers :ExportKeysNotionCSV and calls module
-```
-
-Minimal `plugin/notio.lua` shim (for reference):
-
-```lua
--- plugin/notio.lua
-pcall(function()
-  vim.api.nvim_create_user_command("ExportKeysNotionCSV", function(a)
-    require("notio").export_notion_csv(a.args ~= "" and a.args or nil)
-  end, { nargs = "?" })
-end)
+├── LICENSE
+├── README.md
+└── lua
+    └── notio
+        ├── init.lua     # setup + sync commands + planning/logging
+        ├── keymaps.lua  # collection, normalization, heuristics, rows
+        └── notion.lua   # minimal Notion client (query/create/update/index)
 ```
 
 ---
 
-## Import into Notion
+## Changelog
 
-1. Open your **KeyBindings** database.
-2. Click **… > Merge with CSV** (or **New database > CSV** for first import).
-3. Map columns 1:1 (names match your schema).
-4. After import, adjust **Tier**, **Status**, or additional relations as needed.
-
-> Tip: Keep the same column order to make imports seamless. For incremental updates, you can filter/merge by **Name + Mode + Prefix** or your preferred composite key.
-
----
-
-## Roadmap
-
-- **Direct Notion API export** (no CSV) using `notion_client` with token from 1Password.
-- **Incremental sync** (detect changes vs last export; upsert by composite key).
-- **Plugin analytics** (e.g., orphaned maps, conflicting prefixes).
-- **Config-as-code** (`setup{}`) + user autocommands.
+- **0.1.1**
+  - Notion sync: create/update/rebind with rich-text `Action/Description`, `UID`, relations.
+  - Dry-run planner + live log buffer.
+  - Backfill command to stamp UID where missing.
+  - Safer defaults (`update_only`, skip built-ins/prefix families).
 
 ---
 
 ## License
 
 MIT — see `LICENSE`.
-
----
-
-## Acknowledgements
-
-Built for a Neovim + Notion workflow where clarity and searchability matter.
